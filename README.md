@@ -96,4 +96,3 @@ vmctl.sh upgrade [--force]                   # update this skill from GitHub
 
 [MIT](LICENSE)
 
-<!-- vim: set spell -->
