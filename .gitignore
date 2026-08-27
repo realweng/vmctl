@@ -1,0 +1,7 @@
+# local test artifacts
+.test-*
+*.log
+
+# editor
+.idea/
+.vscode/
