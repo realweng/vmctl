@@ -1,5 +1,7 @@
 # vmctl
 
+[English](README.md) | **简体中文**
+
 **跨平台的本机 VMware Workstation 虚拟机控制 Agent Skill。**
 
 `vmctl` 封装了 VMware 的 `vmrun` 命令行，让 AI 编程助手（Kimi Code、Claude Code、Codex 等任何加载 `.agents/skills` 技能的 agent）可以直接开关虚拟机、管理快照、查询状态 —— 在 **Windows (Git Bash)** 或 **WSL** 下均可使用，无需手动配置。

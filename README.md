@@ -1,5 +1,7 @@
 # vmctl
 
+**English** | [简体中文](README.zh-CN.md)
+
 **A cross-platform agent skill for controlling local VMware Workstation virtual machines.**
 
 `vmctl` wraps VMware's `vmrun` CLI so that AI coding agents (Kimi Code, Claude Code, Codex, or any agent that loads `.agents/skills` skills) can power VMs on/off, manage snapshots, and query state — from **Windows (Git Bash)** or **WSL**, with zero manual configuration.
@@ -10,8 +12,6 @@ vmctl stop "Windows Server 2019"   # graceful shutdown
 vmctl snapshot UbuntuServer1 pre-upgrade
 vmctl revert UbuntuServer1 pre-upgrade
 ```
-
-[中文说明](README.zh-CN.md)
 
 ## Why
 
