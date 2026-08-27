@@ -51,6 +51,8 @@ bash ~/.agents/skills/vmctl/scripts/vmctl.sh doctor
 
 > Requirements: bash, `iconv` (usually preinstalled); VMware Workstation on Windows (interop enabled in WSL — the default) or VMware Fusion on macOS.
 
+**Update:** `bash ~/.agents/skills/vmctl/scripts/vmctl.sh upgrade [--force]` — fast-forwards the git clone (or re-downloads if installed by copy); `--force` discards local changes.
+
 ## Usage
 
 ```
@@ -66,6 +68,7 @@ vmctl.sh snapshot <vm> <name>                # create snapshot
 vmctl.sh snapshots <vm> [--tree]             # list snapshots
 vmctl.sh revert <vm> <name>                  # restore snapshot
 vmctl.sh delsnap <vm> <name> [--children]    # delete snapshot
+vmctl.sh upgrade [--force]                   # update this skill from GitHub
 ```
 
 `<vm>` matches case-insensitively by display name, vmx basename, or full `.vmx` path (exact match first, then unique substring; e.g. `server2` → `UbuntuServer2`). Ambiguity is reported with candidates.

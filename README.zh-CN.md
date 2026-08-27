@@ -51,6 +51,8 @@ bash ~/.agents/skills/vmctl/scripts/vmctl.sh doctor
 
 > 依赖：bash、`iconv`（一般都自带）；Windows 上装 VMware Workstation（WSL 需启用 interop，默认开启），macOS 装 VMware Fusion。
 
+**升级：** `bash ~/.agents/skills/vmctl/scripts/vmctl.sh upgrade [--force]` —— git 克隆安装直接快进更新（复制安装则重新下载覆盖）；`--force` 丢弃本地改动。
+
 ## 使用
 
 ```
@@ -66,6 +68,7 @@ vmctl.sh snapshot <vm> <name>                # 创建快照
 vmctl.sh snapshots <vm> [--tree]             # 列出快照
 vmctl.sh revert <vm> <name>                  # 恢复快照
 vmctl.sh delsnap <vm> <name> [--children]    # 删除快照
+vmctl.sh upgrade [--force]                   # 从 GitHub 升级本技能
 ```
 
 `<vm>` 按显示名、vmx 文件名或完整 `.vmx` 路径不区分大小写匹配（先精确，再唯一子串；如 `server2` → `UbuntuServer2`）。匹配多台时会报错并列出候选。

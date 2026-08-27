@@ -34,6 +34,7 @@ bash ~/.agents/skills/vmctl/scripts/vmctl.sh stop UbuntuServer1      # soft shut
 | `snapshots <vm> [--tree]` | List snapshots (hierarchical with `--tree`) |
 | `revert <vm> <name>` | Restore VM to snapshot |
 | `delsnap <vm> <name> [--children]` | Delete snapshot (and its children) |
+| `upgrade [--force]` | Update this skill from GitHub; `--force` discards local changes |
 
 ## VM name matching
 

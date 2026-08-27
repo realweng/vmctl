@@ -27,6 +27,9 @@ esac
 CONFIG_DIR="$HOME/.config/vmctl"
 CACHE_FILE="$CONFIG_DIR/paths"
 
+SKILL_REPO_HTTPS="https://github.com/realweng/vmctl"
+SKILL_REPO_SSH="git@github.com:realweng/vmctl.git"
+
 # ---------- locate vmrun ----------
 VMRUN=""
 VMRUN_SRC=""
@@ -174,6 +177,11 @@ to_unix_path() { # windows-style path -> unix-style (best effort)
 canon() { printf '%s\n' "$1" | tr '[:upper:]\\' '[:lower:]/'; }
 
 basename_of_vmx() { local p; p="${1##*[\\/]}"; printf '%s\n' "${p%.[vV][mM][xX]}"; }
+
+skill_root() { # directory containing scripts/ (i.e. the skill install dir)
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" && printf '%s\n' "$d"
+}
 
 # ---------- inventory / running state ----------
 INVENTORY=""
@@ -391,6 +399,65 @@ cmd_delsnap() {
   info "$RESOLVED_NAME: snapshot '$snap' deleted${kids:+ (with children)}"
 }
 
+# ---------- self-upgrade ----------
+repo_fetch() { # $1 = git dir; fetch main from upstream (https first, ssh fallback)
+  git -C "$1" fetch -q "$SKILL_REPO_HTTPS" main 2>/dev/null && return 0
+  info "https fetch failed, trying ssh..."
+  git -C "$1" fetch -q "$SKILL_REPO_SSH" main && return 0
+  return 1
+}
+
+repo_clone() { # $1 = dest dir; shallow clone from upstream (https first, ssh fallback)
+  git clone -q --depth 1 "$SKILL_REPO_HTTPS" "$1" 2>/dev/null && return 0
+  info "https clone failed, trying ssh..."
+  git clone -q --depth 1 "$SKILL_REPO_SSH" "$1" && return 0
+  return 1
+}
+
+cmd_upgrade() {
+  local force=0
+  [ "${1:-}" = "--force" ] && force=1
+  local dir tmp old new
+  dir="$(skill_root)"
+  info "skill dir: $dir"
+  if [ -d "$dir/.git" ] && command -v git >/dev/null 2>&1; then
+    if [ -n "$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ] && [ "$force" -ne 1 ]; then
+      die "skill dir has local changes; run 'vmctl.sh upgrade --force' to overwrite them"
+    fi
+    old="$(git -C "$dir" log -1 --format='%h (%cs)' 2>/dev/null || echo unknown)"
+    repo_fetch "$dir" || die "fetch from $SKILL_REPO_HTTPS failed (network?)"
+    if [ "$(git -C "$dir" rev-parse HEAD)" = "$(git -C "$dir" rev-parse FETCH_HEAD)" ]; then
+      info "already up to date ($old)"; return 0
+    fi
+    if [ "$force" -eq 1 ]; then
+      git -C "$dir" reset --hard -q FETCH_HEAD || die "git reset failed"
+    else
+      git -C "$dir" merge --ff-only -q FETCH_HEAD || die "cannot fast-forward (history diverged); run 'vmctl.sh upgrade --force'"
+    fi
+    new="$(git -C "$dir" log -1 --format='%h (%cs)')"
+    info "upgraded: $old -> $new"
+  else
+    # not a git checkout: overlay a fresh copy (includes .git, so future upgrades are git-based)
+    command -v git >/dev/null 2>&1 || command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+      || die "upgrade needs git or curl/wget"
+    tmp="$(mktemp -d)" || die "mktemp failed"
+    if command -v git >/dev/null 2>&1; then
+      repo_clone "$tmp/vmctl" || { rm -rf "$tmp"; die "clone from $SKILL_REPO_HTTPS failed (network?)"; }
+    else
+      mkdir -p "$tmp/vmctl" || { rm -rf "$tmp"; die "mkdir failed"; }
+      ( cd "$tmp/vmctl" \
+        && { curl -fsSL "$SKILL_REPO_HTTPS/archive/refs/heads/main.tar.gz" -o src.tgz \
+             || wget -qO src.tgz "$SKILL_REPO_HTTPS/archive/refs/heads/main.tar.gz"; } \
+        && tar -xzf src.tgz --strip-components=1 ) || { rm -rf "$tmp"; die "download/extract failed"; }
+    fi
+    cp -a "$tmp/vmctl/." "$dir/" || { rm -rf "$tmp"; die "copying into skill dir failed"; }
+    rm -rf "$tmp"
+    new="$(git -C "$dir" log -1 --format='%h (%cs)' 2>/dev/null || echo latest)"
+    info "upgraded to $new (install is now a git checkout; future upgrades use git)"
+  fi
+  info "restart your agent session to reload the skill"
+}
+
 usage() {
   cat <<'EOF'
 vmctl — control local VMware VMs via vmrun (Windows / WSL / Linux / macOS)
@@ -407,6 +474,7 @@ usage: vmctl.sh doctor
        vmctl.sh snapshots <vm> [--tree]                 list snapshots
        vmctl.sh revert    <vm> <snap-name>              restore snapshot
        vmctl.sh delsnap   <vm> <snap-name> [--children] delete snapshot
+       vmctl.sh upgrade   [--force]                     update this skill from GitHub
 
 <vm>: VM display name, vmx file basename, or full .vmx path
       (WSL /mnt/e/..., Git Bash /e/..., or Windows E:\... style all work)
@@ -456,6 +524,10 @@ main() {
       case $# in 2|3) ;; *) die_usage "usage: vmctl.sh delsnap <vm> <snap-name> [--children]";; esac
       [ $# -eq 3 ] && [ "$3" != "--children" ] && die_usage "delsnap: unknown option '$3' (only --children)"
       cmd_delsnap "$@" ;;
+    upgrade)
+      case $# in 0|1) ;; *) die_usage "usage: vmctl.sh upgrade [--force]";; esac
+      [ $# -eq 1 ] && [ "$1" != "--force" ] && die_usage "upgrade: unknown option '$1' (only --force)"
+      cmd_upgrade "${1:-}" ;;
     help|-h|--help) usage ;;
     *) usage >&2; exit 64 ;;
   esac
