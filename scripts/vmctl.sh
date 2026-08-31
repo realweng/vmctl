@@ -521,7 +521,7 @@ cmd_netcheck() { # vmctl netcheck <vm> [-u user] [-p pass] [--fix-dhcp]
     bridged)  [ -n "$vmnet" ] || vmnet=0 ;;
     "")       conn=bridged;  [ -n "$vmnet" ] || vmnet=0 ;;
   esac
-  ipaddr="$("$VMRUN" getGuestIPAddress "$RESOLVED_PATH" </dev/null 2>/dev/null | tr -d '\r')"
+  ipaddr="$("$VMRUN" getGuestIPAddress "$RESOLVED_PATH" </dev/null 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+(\.[0-9]+){3}$')"
   info "$RESOLVED_NAME: network check (host side)"
   info "  adapter : ethernet0 ${conn}${vmnet:+ (VMnet$vmnet)}"
   info "  guest IP: ${ipaddr:-unknown (needs VMware Tools)}"
