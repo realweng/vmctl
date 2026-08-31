@@ -372,6 +372,219 @@ cmd_ip() {
     || die "could not get guest IP (VMware Tools installed and guest fully booted?)"
 }
 
+# ---------- guest operations (need VMware Tools + guest credentials) ----------
+# Connectivity probe executed inside the guest (no root needed). Prints one
+# status line per check and exits 0 iff at least one public IP answers ping.
+GUEST_CHECK_SCRIPT='
+ip -4 -o addr show scope global | sed "s/^/addr: /"
+gw="$(ip route show default | awk "{print \$3; exit}")"
+if [ -n "$gw" ]; then
+  echo "gw: $gw"
+  if ping -c1 -W2 "$gw" >/dev/null 2>&1; then echo "gateway: reachable"; else echo "gateway: UNREACHABLE"; fi
+else
+  echo "gw: none"
+fi
+i1=fail; i2=fail
+ping -c1 -W3 223.5.5.5 >/dev/null 2>&1 && i1=ok
+ping -c1 -W3 8.8.8.8  >/dev/null 2>&1 && i2=ok
+if [ "$i1" = ok ] || [ "$i2" = ok ]; then echo "internet: reachable"; else echo "internet: UNREACHABLE"; fi
+if getent hosts github.com >/dev/null 2>&1; then echo "dns: ok"; else echo "dns: FAILED"; fi
+[ "$i1" = ok ] || [ "$i2" = ok ]
+'
+
+guest_auth_set() { # $1 = -u value, $2 = -p value ("" falls back to env)
+  GU="${1:-${VMCTL_GUEST_USER:-}}"
+  GP="${2:-${VMCTL_GUEST_PASS:-}}"
+  [ -n "$GU" ] && [ -n "$GP" ] || die_usage "guest credentials required: -u <user> -p <pass> (or env VMCTL_GUEST_USER / VMCTL_GUEST_PASS)"
+}
+
+# Run a shell script (/bin/bash) in the guest; print its stdout+stderr on the
+# host and return the guest exit code. vmrun does not stream guest output, so
+# it is relayed through a guest temp file + copyFileFromGuestToHost.
+guest_run() { # $1 = windows-style vmx, $2 = script text
+  local vmx="$1" script="$2" gout hout full rc
+  gout="//tmp/vmctl.$$.$RANDOM.out"   # '//' survives MSYS/WSL arg conversion; guests collapse it to /tmp
+  hout="$(mktemp "${TMPDIR:-/tmp}/vmctl-guest.XXXXXX")" || die "mktemp failed"
+  full="exec > $gout 2>&1"$'\n'"$script"$'\n''printf "__VMCTL_RC=%s\n" "$?"'
+  MSYS_NO_PATHCONV=1 "$VMRUN" -T ws -gu "$GU" -gp "$GP" runScriptInGuest "$vmx" /bin/bash "$full" </dev/null \
+    || { rm -f "$hout"; die "could not run script in guest (VMware Tools running? guest credentials correct?)"; }
+  MSYS_NO_PATHCONV=1 "$VMRUN" -T ws -gu "$GU" -gp "$GP" copyFileFromGuestToHost "$vmx" "$gout" "$(to_win_path "$hout")" </dev/null \
+    || { rm -f "$hout"; die "could not copy guest output back to host"; }
+  MSYS_NO_PATHCONV=1 "$VMRUN" -T ws -gu "$GU" -gp "$GP" runScriptInGuest "$vmx" /bin/bash "rm -f '$gout'" </dev/null >/dev/null 2>&1 || true
+  rc="$(sed -n 's/^__VMCTL_RC=//p' "$hout" | tail -n 1)"
+  sed '/^__VMCTL_RC=/d' "$hout"
+  rm -f "$hout"
+  [ -n "$rc" ] || rc=0
+  return "$rc"
+}
+
+cmd_exec() { # vmctl exec <vm> [-u user] [-p pass] -- <shell command...>
+  local vm="" gu="" gp="" c
+  local cmd=()
+  while [ $# -gt 0 ]; do
+    c="$1"
+    case "$c" in
+      -u|--user) [ $# -ge 2 ] || die_usage "missing value after $c"; gu="$2"; shift 2 ;;
+      -p|--pass) [ $# -ge 2 ] || die_usage "missing value after $c"; gp="$2"; shift 2 ;;
+      --)        shift; cmd=("$@"); break ;;
+      -*)        die_usage "exec: unknown option '$c'" ;;
+      *) [ -z "$vm" ] || die_usage "usage: vmctl.sh exec <vm> [-u user] [-p pass] -- <shell command...>"; vm="$c"; shift ;;
+    esac
+  done
+  [ -n "$vm" ] || die_usage "usage: vmctl.sh exec <vm> [-u user] [-p pass] -- <shell command...>"
+  [ ${#cmd[@]} -gt 0 ] || die_usage "exec: nothing to run (put the command after '--')"
+  guest_auth_set "$gu" "$gp"
+  load_env; resolve_vm "$vm"
+  is_running "$RESOLVED_PATH" || die "$RESOLVED_NAME is not running"
+  guest_run "$RESOLVED_PATH" "${cmd[*]}"
+}
+
+# vmnet subnet for a VMnet number: "a.b.c.d/n" from VMware's config (Windows:
+# vmnetdhcp.conf segments; macOS Fusion: networking preferences). "" if unknown.
+vmnet_subnet() {
+  local n="$1" f line sub
+  case "$ENV_KIND" in
+    winbash|linux) f="/c/ProgramData/VMware/vmnetdhcp.conf" ;;
+    wsl)           f="/mnt/c/ProgramData/VMware/vmnetdhcp.conf" ;;
+    macos)
+      f="/Library/Preferences/VMware Fusion/networking"
+      [ -f "$f" ] || return 0
+      printf '%s\n' "$(sed -n 's/^VNET_'"$n"'_HOSTONLY_SUBNET=//p' "$f" | head -n 1)/24"
+      return 0 ;;
+    *) return 0 ;;
+  esac
+  [ -f "$f" ] || return 0
+  line="$(awk -v n="$n" 'tolower($0) ~ ("# virtual ethernet segment " n "$") {seen=1; next}
+                          seen && /subnet / {print; exit}' "$f" 2>/dev/null)"
+  sub="$(printf '%s' "$line" | sed -n 's/^subnet \([0-9.]*\) netmask \([0-9.]*\) {/\1|\2/p')"
+  [ -n "$sub" ] || return 0
+  local addr="${sub%%|*}" mask="${sub#*|}" bits=0 o
+  for o in ${mask//./ }; do
+    case "$o" in
+      255) bits=$((bits+8));; 254) bits=$((bits+7));; 252) bits=$((bits+6));;
+      248) bits=$((bits+5));; 240) bits=$((bits+4));; 224) bits=$((bits+3));;
+      192) bits=$((bits+2));; 128) bits=$((bits+1));; 0) ;;
+    esac
+  done
+  printf '%s/%s\n' "$addr" "$bits"
+}
+
+in_subnet() { # $1 = ip, $2 = a.b.c.d[/n] (default /24; octet-aligned subnets only)
+  local ip="$1" spec="$2" net bits i
+  case "$spec" in */*) net="${spec%%/*}"; bits="${spec#*/}";; *) net="$spec"; bits=24;; esac
+  local n_oct=$((bits/8)); [ "$n_oct" -gt 4 ] && n_oct=4
+  local -a ia na
+  IFS=. read -r ia[0] ia[1] ia[2] ia[3] <<< "$ip"
+  IFS=. read -r na[0] na[1] na[2] na[3] <<< "$net"
+  for ((i=0; i<n_oct; i++)); do
+    [ "${ia[i]:-x}" = "${na[i]:-y}" ] || return 1
+  done
+  return 0
+}
+
+win_service_state() { # $1 = service name -> running|stopped|unknown
+  local scq
+  case "$ENV_KIND" in
+    winbash) scq="$(command -v sc.exe 2>/dev/null || command -v sc 2>/dev/null)" ;;
+    wsl)     scq=/mnt/c/Windows/System32/sc.exe ;;
+    *) return 2 ;;
+  esac
+  [ -n "$scq" ] || { echo unknown; return 0; }
+  if "$scq" query "$1" </dev/null 2>/dev/null | grep -q RUNNING; then echo running; else echo stopped; fi
+}
+
+cmd_netcheck() { # vmctl netcheck <vm> [-u user] [-p pass] [--fix-dhcp]
+  local vm="" gu="" gp="" fix=0 c
+  while [ $# -gt 0 ]; do
+    c="$1"
+    case "$c" in
+      -u|--user)  [ $# -ge 2 ] || die_usage "missing value after $c"; gu="$2"; shift 2 ;;
+      -p|--pass)  [ $# -ge 2 ] || die_usage "missing value after $c"; gp="$2"; shift 2 ;;
+      --fix-dhcp) fix=1; shift ;;
+      -*) die_usage "netcheck: unknown option '$c'" ;;
+      *) [ -z "$vm" ] || die_usage "usage: vmctl.sh netcheck <vm> [-u user] [-p pass] [--fix-dhcp]"; vm="$c"; shift ;;
+    esac
+  done
+  [ -n "$vm" ] || die_usage "usage: vmctl.sh netcheck <vm> [-u user] [-p pass] [--fix-dhcp]"
+  load_env; resolve_vm "$vm"
+  is_running "$RESOLVED_PATH" || die "$RESOLVED_NAME is not running"
+
+  # ---- host side: adapter type, vmnet subnet, guest IP, NAT/DHCP services ----
+  local vmx_u conn vnet vmnet subnet ipaddr
+  vmx_u="$(to_unix_path "$RESOLVED_PATH")"
+  conn="$(tr -d '\r' < "$vmx_u" | sed -n 's/^[[:space:]]*ethernet0\.connectionType[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/Ip' | head -n 1)"
+  vnet="$(tr -d '\r' < "$vmx_u" | sed -n 's/^[[:space:]]*ethernet0\.vnet[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/Ip' | head -n 1)"
+  vmnet="$vnet"
+  case "$(printf '%s' "$conn" | tr '[:upper:]' '[:lower:]')" in
+    nat)      [ -n "$vmnet" ] || vmnet=8 ;;
+    hostonly) [ -n "$vmnet" ] || vmnet=1 ;;
+    bridged)  [ -n "$vmnet" ] || vmnet=0 ;;
+    "")       conn=bridged;  [ -n "$vmnet" ] || vmnet=0 ;;
+  esac
+  ipaddr="$("$VMRUN" getGuestIPAddress "$RESOLVED_PATH" </dev/null 2>/dev/null | tr -d '\r')"
+  info "$RESOLVED_NAME: network check (host side)"
+  info "  adapter : ethernet0 ${conn}${vmnet:+ (VMnet$vmnet)}"
+  info "  guest IP: ${ipaddr:-unknown (needs VMware Tools)}"
+  subnet="$(vmnet_subnet "$vmnet")"
+  case "$vmnet" in
+    0) info "  network : bridged — guest shares the physical LAN, no virtual subnet" ;;
+    *)
+      if [ -n "$subnet" ]; then
+        info "  VMnet$vmnet subnet: $subnet"
+        if [ -n "$ipaddr" ]; then
+          if in_subnet "$ipaddr" "$subnet"; then
+            info "  guest IP is inside the VMnet$vmnet subnet: OK"
+          else
+            info "  MISMATCH: guest IP is OUTSIDE the VMnet$vmnet subnet ($subnet)"
+            info "  → most likely cause: static IP in the guest from an old subnet. Run:"
+            info "    vmctl.sh netcheck $vm -u <user> -p <pass> --fix-dhcp"
+          fi
+        fi
+      else
+        info "  VMnet$vmnet subnet: unknown (config file not found)"
+      fi
+      if [ "$ENV_KIND" = winbash ] || [ "$ENV_KIND" = wsl ]; then
+        info "  services: VMware DHCP $(win_service_state VMnetDHCP), VMware NAT $(win_service_state 'VMware NAT Service')"
+      fi ;;
+  esac
+
+  # ---- guest side: needs credentials ----
+  GU="$gu"; GP="$gp"
+  if [ -z "$GU" ] || [ -z "$GP" ]; then
+    GU="${VMCTL_GUEST_USER:-}"; GP="${VMCTL_GUEST_PASS:-}"
+  fi
+  if [ -z "$GU" ] || [ -z "$GP" ]; then
+    [ "$fix" -eq 1 ] && die "--fix-dhcp needs guest credentials: -u <user> -p <pass> (or env VMCTL_GUEST_USER/VMCTL_GUEST_PASS)"
+    info "  tip: add -u <user> -p <pass> (or env VMCTL_GUEST_USER/VMCTL_GUEST_PASS) to also probe inside the guest"
+    return 0
+  fi
+
+  local script="" rc
+  if [ "$fix" -eq 1 ]; then
+    info "  --fix-dhcp: switching static ethernet connections to DHCP..."
+    # password interpolated for non-interactive sudo; only valid if $GP is shell-safe
+    script="if [ \"\$(id -u)\" != 0 ]; then printf '%s\n' '$GP' | sudo -S -p '' -v 2>/dev/null; fi
+nmcli -t -f NAME,TYPE con show 2>/dev/null | while IFS=: read -r n t; do
+  [ \"\$t\" = 802-3-ethernet ] || continue
+  m=\$(nmcli -g ipv4.method con show \"\$n\" 2>/dev/null)
+  if [ -n \"\$m\" ] && [ \"\$m\" != auto ]; then
+    sudo nmcli con mod \"\$n\" ipv4.method auto ipv4.addresses '' ipv4.gateway '' ipv4.dns '' \
+      && sudo nmcli con up \"\$n\" >/dev/null 2>&1 && echo \"fixed: \$n switched to DHCP\"
+  fi
+done
+sleep 3"
+  fi
+  info "  --- inside guest ---"
+  rc=0
+  guest_run "$RESOLVED_PATH" "$script$GUEST_CHECK_SCRIPT" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    info "  → $RESOLVED_NAME has internet: OK"
+    return 0
+  fi
+  info "  → $RESOLVED_NAME has NO internet (see lines above; a MISMATCH above means wrong subnet/static IP)"
+  return 1
+}
+
 cmd_snapshot() { # create
   load_env; resolve_vm "$1"
   "$VMRUN" snapshot "$RESOLVED_PATH" "$2" </dev/null || die "vmrun snapshot failed"
@@ -470,6 +683,10 @@ usage: vmctl.sh doctor
        vmctl.sh suspend   <vm> [soft|hard]
        vmctl.sh reset     <vm> [soft|hard]
        vmctl.sh ip        <vm> [--wait]
+       vmctl.sh exec      <vm> [-u user] [-p pass] -- <shell command...>
+                                                          run a bash command inside the guest (Linux guests, needs VMware Tools)
+       vmctl.sh netcheck  <vm> [-u user] [-p pass] [--fix-dhcp]
+                                                          diagnose guest connectivity; --fix-dhcp switches static NICs to DHCP
        vmctl.sh snapshot  <vm> <snap-name>              create snapshot
        vmctl.sh snapshots <vm> [--tree]                 list snapshots
        vmctl.sh revert    <vm> <snap-name>              restore snapshot
@@ -481,6 +698,7 @@ usage: vmctl.sh doctor
 
 env:  VMCTL_VMRUN      override vmrun path
       VMCTL_INVENTORY  override inventory.vmls path
+      VMCTL_GUEST_USER / VMCTL_GUEST_PASS   default guest credentials for exec/netcheck
 EOF
 }
 
@@ -508,6 +726,12 @@ main() {
       case $# in 1|2) ;; *) die_usage "usage: vmctl.sh ip <vm> [--wait]";; esac
       [ $# -eq 2 ] && [ "$2" != "--wait" ] && die_usage "ip: unknown option '$2' (only --wait)"
       cmd_ip "$@" ;;
+    exec)
+      [ $# -ge 1 ] || die_usage "usage: vmctl.sh exec <vm> [-u user] [-p pass] -- <shell command...>"
+      cmd_exec "$@" ;;
+    netcheck)
+      [ $# -ge 1 ] || die_usage "usage: vmctl.sh netcheck <vm> [-u user] [-p pass] [--fix-dhcp]"
+      cmd_netcheck "$@" ;;
     snapshot)
       case $# in 2) ;; *) die_usage "usage: vmctl.sh snapshot <vm> <snap-name>";; esac
       case "$2" in -*) die_usage "invalid snapshot name '$2'";; esac

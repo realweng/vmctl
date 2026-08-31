@@ -11,6 +11,8 @@ vmctl start UbuntuServer1          # 无界面开机
 vmctl stop "Windows Server 2019"   # 优雅关机
 vmctl snapshot UbuntuServer1 pre-upgrade
 vmctl revert UbuntuServer1 pre-upgrade
+vmctl exec UbuntuServer1 -u me -p pass -- 'systemctl status nginx'
+vmctl netcheck kali -u me -p pass --fix-dhcp   # 诊断并修复客户机网络
 ```
 
 ## 为什么需要它
@@ -21,6 +23,7 @@ vmctl revert UbuntuServer1 pre-upgrade
 功能：
 
 - **电源操作** —— `start`（后台或 `--gui`）、`stop`（`soft`/`hard`）、`suspend`、`reset`、`status`、客户机 `ip`
+- **客户机操作** —— `exec` 在客户机内执行 bash 命令并返回输出与退出码；`netcheck` 端到端诊断客户机网络（网卡类型与 VMnet 网段是否匹配、DHCP/NAT 服务状态、客户机内网关/外网/DNS 连通性），`--fix-dhcp` 可把过期的静态 IP 一键切回 DHCP
 - **快照管理** —— 创建 / 列表（`--tree`）/ 恢复 / 删除（`--children`）
 - **智能虚拟机发现** —— 读取 VMware 的 `inventory.vmls`，按显示名、vmx 文件名或完整路径匹配（任意路径风格）
 - **健壮的 vmrun 探测** —— 环境变量 → 缓存（`~/.config/vmctl/paths`）→ `PATH` → 各盘符常见安装位置 → Windows 注册表；首次成功后缓存
@@ -64,6 +67,10 @@ vmctl.sh stop <vm> [soft|hard]               # 默认 soft（优雅关机，需 
 vmctl.sh suspend <vm> [soft|hard]
 vmctl.sh reset <vm> [soft|hard]
 vmctl.sh ip <vm> [--wait]
+vmctl.sh exec <vm> [-u user] [-p pass] -- <shell 命令...>
+                                             # 在客户机内执行 bash 命令（Linux 客户机）
+vmctl.sh netcheck <vm> [-u user] [-p pass] [--fix-dhcp]
+                                             # 诊断客户机网络；--fix-dhcp 把静态网卡切回 DHCP
 vmctl.sh snapshot <vm> <name>                # 创建快照
 vmctl.sh snapshots <vm> [--tree]             # 列出快照
 vmctl.sh revert <vm> <name>                  # 恢复快照
@@ -79,17 +86,20 @@ vmctl.sh upgrade [--force]                   # 从 GitHub 升级本技能
 |---|---|
 | `VMCTL_VMRUN` | 自动探测失败时，手动指定 `vmrun`/`vmrun.exe` 完整路径 |
 | `VMCTL_INVENTORY` | 默认位置找不到 `inventory.vmls` 时手动指定 |
+| `VMCTL_GUEST_USER` / `VMCTL_GUEST_PASS` | `exec`/`netcheck` 的默认客户机账号密码（免每次加 `-u`/`-p`） |
 
 ## 工作原理
 
 - **vmrun 探测** —— `VMCTL_VMRUN` → 缓存 → `command -v vmrun` → 常见安装路径（Windows 所有盘符、WSL 的 `/mnt/*/`、macOS 的 Fusion bundle）→ Windows 卸载注册表（"VMware Workstation" 的 `DisplayIcon`）。结果缓存到 `~/.config/vmctl/paths`。
 - **虚拟机清单** —— 解析 `%APPDATA%\VMware\inventory.vmls`（GBK 解码、去 CRLF）；运行中的虚拟机来自 `vmrun list`。
 - **WSL 支持** —— 通过 interop 调用 Windows 的 `vmrun.exe`；双向转换路径（`wslpath`/`cygpath`）、去除输出中的 CRLF、并防护 interop 吞 stdin 的问题。
+- **客户机操作** —— `exec`/`netcheck` 通过 `vmrun runScriptInGuest` 在客户机内执行脚本；vmrun 不回传客户机输出，因此借助客户机临时文件 + `copyFileFromGuestToHost` 中转。客户机临时路径统一带 `//` 前缀，避免 MSYS/WSL 的参数路径改写。
 
 ## 故障排查
 
 - **`vmrun not found`** —— 运行 `vmctl.sh doctor`；仍失败则设置 `VMCTL_VMRUN=/path/to/vmrun(.exe)`。
 - **`soft` 关机失败 / 拿不到 IP** —— 客户机未装 VMware Tools；用 `hard`，或在客户机内安装 `open-vm-tools`（Linux）/ VMware Tools（Windows）。
+- **客户机没网络** —— 运行 `vmctl.sh netcheck <vm> -u <用户> -p <密码>`。最常见的病因：客户机里配着旧 NAT/仅主机网段的静态 IP（比如 VMware 升级或虚拟网络编辑器"恢复默认"后 VMnet 网段变了），导致够不到 NAT 网关。`--fix-dhcp` 可一键把客户机网卡切回 DHCP；宿主机侧会对比客户机 IP 与 VMware 配置中的 VMnet 网段，并检查 Windows 的 DHCP/NAT 服务状态。
 - **WSL：interop 被禁用** —— 检查 `/etc/wsl.conf` 未禁用（`[interop] enabled=true` 为默认），然后 `wsl --shutdown` 后重试。
 
 ## 许可证

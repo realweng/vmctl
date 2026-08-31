@@ -11,6 +11,8 @@ vmctl start UbuntuServer1          # power on, headless
 vmctl stop "Windows Server 2019"   # graceful shutdown
 vmctl snapshot UbuntuServer1 pre-upgrade
 vmctl revert UbuntuServer1 pre-upgrade
+vmctl exec UbuntuServer1 -u me -p pass -- 'systemctl status nginx'
+vmctl netcheck kali -u me -p pass --fix-dhcp   # diagnose & fix guest networking
 ```
 
 ## Why
@@ -21,6 +23,7 @@ vmctl revert UbuntuServer1 pre-upgrade
 Features:
 
 - **Power ops** — `start` (headless or `--gui`), `stop` (`soft`/`hard`), `suspend`, `reset`, `status`, guest `ip`
+- **Guest operations** — `exec` runs a bash command inside the guest and returns its output/exit code; `netcheck` diagnoses guest connectivity end-to-end (adapter type vs VMnet subnet match, DHCP/NAT service state, gateway/internet/DNS from inside the guest) and `--fix-dhcp` switches stale static IPs back to DHCP
 - **Snapshots** — create / list (`--tree`) / revert / delete (`--children`)
 - **Smart VM discovery** — reads VMware's `inventory.vmls`, matches by display name, vmx basename, or full path (any path style)
 - **Robust vmrun detection** — env var → cache (`~/.config/vmctl/paths`) → `PATH` → common install locations on every drive → Windows registry; cached after first success
@@ -64,6 +67,10 @@ vmctl.sh stop <vm> [soft|hard]               # default: soft (graceful, needs VM
 vmctl.sh suspend <vm> [soft|hard]
 vmctl.sh reset <vm> [soft|hard]
 vmctl.sh ip <vm> [--wait]
+vmctl.sh exec <vm> [-u user] [-p pass] -- <shell command...>
+                                             # run a bash command inside the guest (Linux guests)
+vmctl.sh netcheck <vm> [-u user] [-p pass] [--fix-dhcp]
+                                             # diagnose guest connectivity; --fix-dhcp switches static NICs to DHCP
 vmctl.sh snapshot <vm> <name>                # create snapshot
 vmctl.sh snapshots <vm> [--tree]             # list snapshots
 vmctl.sh revert <vm> <name>                  # restore snapshot
@@ -79,17 +86,20 @@ vmctl.sh upgrade [--force]                   # update this skill from GitHub
 |---|---|
 | `VMCTL_VMRUN` | Full path to `vmrun`/`vmrun.exe` when auto-detection can't find it |
 | `VMCTL_INVENTORY` | Full path to `inventory.vmls` when the default location isn't found |
+| `VMCTL_GUEST_USER` / `VMCTL_GUEST_PASS` | Default guest OS credentials for `exec`/`netcheck` (instead of `-u`/`-p` flags) |
 
 ## How it works
 
 - **vmrun discovery** — `VMCTL_VMRUN` → cached path → `command -v vmrun` → common install paths (every drive letter on Windows, `/mnt/*/` in WSL, Fusion bundle on macOS) → Windows uninstall registry (`DisplayIcon` of "VMware Workstation"). Result cached in `~/.config/vmctl/paths`.
 - **VM inventory** — parses `%APPDATA%\VMware\inventory.vmls` (GBK-decoded, CRLF-stripped); running VMs come from `vmrun list`.
 - **WSL support** — calls the Windows `vmrun.exe` through interop; translates paths both ways (`wslpath`/`cygpath`), strips CRLF from output, and guards stdin against interop quirks.
+- **Guest ops** — `exec`/`netcheck` run scripts via `vmrun runScriptInGuest`; since vmrun doesn't stream guest output, it's relayed through a guest temp file and `copyFileFromGuestToHost`. Guest temp paths use a `//` prefix so MSYS/WSL argument conversion never rewrites them.
 
 ## Troubleshooting
 
 - **`vmrun not found`** — run `vmctl.sh doctor`; if it still fails, set `VMCTL_VMRUN=/path/to/vmrun(.exe)`.
 - **`soft` stop fails / no guest IP** — guest lacks VMware Tools; use `hard`, install `open-vm-tools` (Linux) or VMware Tools (Windows).
+- **Guest has no network** — run `vmctl.sh netcheck <vm> -u <user> -p <pass>`. The most common cause it catches: the guest holds a static IP from an old NAT/host-only subnet (e.g. after a VMware upgrade or "Restore Default" changed the VMnet subnets), so it can't reach the NAT gateway. `--fix-dhcp` switches the guest NIC back to DHCP in one step, and the host-side check compares the guest IP against the VMnet subnet read from VMware's config (plus DHCP/NAT service state on Windows).
 - **WSL: interop disabled** — ensure `/etc/wsl.conf` doesn't disable it (`[interop] enabled=true`, the default), then `wsl --shutdown` and retry.
 
 ## License
